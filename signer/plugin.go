@@ -162,7 +162,7 @@ func (s *PluginSigner) generateSignature(ctx context.Context, desc ocispec.Descr
 	logger := log.GetLogger(ctx)
 	logger.Debug("Generating signature by plugin")
 	genericSigner := GenericSigner{
-		signer: &pluginPrimitiveSigner{
+		signer: &PluginPrimitiveSigner{
 			ctx:          ctx,
 			plugin:       s.plugin,
 			keyID:        s.keyID,
@@ -325,8 +325,8 @@ func parseCertChain(certChain [][]byte) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
-// pluginPrimitiveSigner implements signature.Signer
-type pluginPrimitiveSigner struct {
+// PluginPrimitiveSigner implements signature.Signer
+type PluginPrimitiveSigner struct {
 	ctx          context.Context
 	plugin       plugin.SignPlugin
 	keyID        string
@@ -335,7 +335,7 @@ type pluginPrimitiveSigner struct {
 }
 
 // Sign signs the digest by calling the underlying plugin.
-func (s *pluginPrimitiveSigner) Sign(payload []byte) ([]byte, []*x509.Certificate, error) {
+func (s *PluginPrimitiveSigner) Sign(payload []byte) ([]byte, []*x509.Certificate, error) {
 	// Execute plugin sign command.
 	keySpec, err := proto.EncodeKeySpec(s.keySpec)
 	if err != nil {
@@ -372,6 +372,35 @@ func (s *pluginPrimitiveSigner) Sign(payload []byte) ([]byte, []*x509.Certificat
 
 // KeySpec returns the keySpec of a keyID by calling describeKey and do some
 // keySpec validation.
-func (s *pluginPrimitiveSigner) KeySpec() (signature.KeySpec, error) {
+func (s *PluginPrimitiveSigner) KeySpec() (signature.KeySpec, error) {
 	return s.keySpec, nil
+}
+
+// NewPluginPrimitiveSigner creates a new PluginPrimitiveSigner that delegates
+// signing to a plugin. This is used for dm-verity PKCS#7 signing where raw
+// signature bytes are needed instead of JWS/COSE envelopes.
+func NewPluginPrimitiveSigner(ctx context.Context, p plugin.SignPlugin, keyID string, keySpec signature.KeySpec, pluginConfig map[string]string) *PluginPrimitiveSigner {
+	return &PluginPrimitiveSigner{
+		ctx:          ctx,
+		plugin:       p,
+		keyID:        keyID,
+		keySpec:      keySpec,
+		pluginConfig: pluginConfig,
+	}
+}
+
+// GetKeySpecFromPlugin retrieves the key specification from a plugin by calling DescribeKey.
+func GetKeySpecFromPlugin(ctx context.Context, p plugin.SignPlugin, keyID string, pluginConfig map[string]string) (signature.KeySpec, error) {
+	req := &plugin.DescribeKeyRequest{
+		ContractVersion: plugin.ContractVersion,
+		KeyID:           keyID,
+		PluginConfig:    pluginConfig,
+	}
+
+	resp, err := p.DescribeKey(ctx, req)
+	if err != nil {
+		return signature.KeySpec{}, err
+	}
+
+	return proto.DecodeKeySpec(resp.KeySpec)
 }
