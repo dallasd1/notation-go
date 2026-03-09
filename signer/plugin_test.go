@@ -166,7 +166,7 @@ func (p *mockPlugin) GenerateEnvelope(ctx context.Context, req *proto.GenerateEn
 			return nil, err
 		}
 
-		primitivePluginSigner := &pluginPrimitiveSigner{
+		primitivePluginSigner := &PluginPrimitiveSigner{
 			ctx:          ctx,
 			plugin:       internalPluginSigner.plugin,
 			keyID:        internalPluginSigner.keyID,
@@ -491,4 +491,54 @@ func basicSignTest(t *testing.T, ps *PluginSigner, envelopeType string, data []b
 		t.Fatalf(" Signer.Sign() cert chain changed")
 	}
 	basicVerification(t, data, envelopeType, mockPlugin.certs[len(mockPlugin.certs)-1], &validMetadata)
+}
+
+func TestNewPluginPrimitiveSigner(t *testing.T) {
+	ctx := context.Background()
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+
+	s := NewPluginPrimitiveSigner(ctx, mp, "testKeyID", defaultKeySpec, nil)
+
+	// verify KeySpec
+	ks, err := s.KeySpec()
+	if err != nil {
+		t.Fatalf("KeySpec() error: %v", err)
+	}
+	if ks != defaultKeySpec {
+		t.Fatalf("KeySpec() = %v, want %v", ks, defaultKeySpec)
+	}
+
+	// verify Sign
+	sig, certs, err := s.Sign([]byte("payload"))
+	if err != nil {
+		t.Fatalf("Sign() error: %v", err)
+	}
+	if len(sig) == 0 {
+		t.Fatal("Sign() returned empty signature")
+	}
+	if len(certs) == 0 {
+		t.Fatal("Sign() returned no certificates")
+	}
+}
+
+func TestGetKeySpecFromPlugin(t *testing.T) {
+	ctx := context.Background()
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+
+	got, err := GetKeySpecFromPlugin(ctx, mp, "testKeyID", nil)
+	if err != nil {
+		t.Fatalf("GetKeySpecFromPlugin() error: %v", err)
+	}
+	if got != defaultKeySpec {
+		t.Fatalf("GetKeySpecFromPlugin() = %v, want %v", got, defaultKeySpec)
+	}
+}
+
+func TestGetKeySpecFromPlugin_Error(t *testing.T) {
+	ctx := context.Background()
+	mp := &mockPlugin{}
+	_, err := GetKeySpecFromPlugin(ctx, mp, "testKeyID", nil)
+	if err == nil {
+		t.Fatal("expected error for empty keySpec, got nil")
+	}
 }
