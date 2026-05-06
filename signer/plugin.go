@@ -325,7 +325,14 @@ func parseCertChain(certChain [][]byte) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
-// PluginPrimitiveSigner implements signature.Signer
+// PluginPrimitiveSigner implements signature.Signer by delegating raw
+// signature generation to a plugin.SignPlugin.
+//
+// Unlike PluginSigner, which produces a complete JWS/COSE signature
+// envelope for OCI artifact signing, PluginPrimitiveSigner returns the raw
+// signature bytes plus the signing certificate chain. This is required
+// by signature envelopes that build their own structure around a
+// pre-computed signature, such as PKCS#7.
 type PluginPrimitiveSigner struct {
 	ctx          context.Context
 	plugin       plugin.SignPlugin
@@ -334,8 +341,13 @@ type PluginPrimitiveSigner struct {
 	keySpec      signature.KeySpec
 }
 
-// Sign signs the digest by calling the underlying plugin.
+// Sign signs the payload by calling the underlying plugin's GenerateSignature command
+// and returns the raw signature bytes together with the signing certificate
+// chain returned by the plugin.
 func (s *PluginPrimitiveSigner) Sign(payload []byte) ([]byte, []*x509.Certificate, error) {
+	if s == nil || s.plugin == nil {
+		return nil, nil, errors.New("PluginPrimitiveSigner not initialized: use NewPluginPrimitiveSigner")
+	}
 	// Execute plugin sign command.
 	keySpec, err := proto.EncodeKeySpec(s.keySpec)
 	if err != nil {
@@ -370,37 +382,57 @@ func (s *PluginPrimitiveSigner) Sign(payload []byte) ([]byte, []*x509.Certificat
 	return resp.Signature, certs, nil
 }
 
-// KeySpec returns the keySpec of a keyID by calling describeKey and do some
-// keySpec validation.
+// KeySpec returns the KeySpec that the signer was constructed with.
+// The keySpec is supplied at construction time (typically via KeySpecFromPlugin).
 func (s *PluginPrimitiveSigner) KeySpec() (signature.KeySpec, error) {
+	if s == nil || s.plugin == nil {
+		return signature.KeySpec{}, errors.New("PluginPrimitiveSigner not initialized: use NewPluginPrimitiveSigner")
+	}
 	return s.keySpec, nil
 }
 
 // NewPluginPrimitiveSigner creates a new PluginPrimitiveSigner that delegates
-// signing to a plugin. This is used for dm-verity PKCS#7 signing where raw
-// signature bytes are needed instead of JWS/COSE envelopes.
-func NewPluginPrimitiveSigner(ctx context.Context, p plugin.SignPlugin, keyID string, keySpec signature.KeySpec, pluginConfig map[string]string) *PluginPrimitiveSigner {
+// signing to a plugin. It is intended for callers that need raw signature
+// bytes (PKCS#7) rather than a JWS/COSE envelope.
+func NewPluginPrimitiveSigner(ctx context.Context, p plugin.SignPlugin, keyID string, keySpec signature.KeySpec, pluginConfig map[string]string) (signature.Signer, error) {
+	if p == nil {
+		return nil, errors.New("nil plugin")
+	}
+	if keyID == "" {
+		return nil, errors.New("keyID not specified")
+	}
+	if _, err := proto.HashAlgorithmFromKeySpec(keySpec); err != nil {
+		return nil, fmt.Errorf("invalid keySpec: %w", err)
+	}
 	return &PluginPrimitiveSigner{
 		ctx:          ctx,
 		plugin:       p,
 		keyID:        keyID,
 		keySpec:      keySpec,
 		pluginConfig: pluginConfig,
-	}
+	}, nil
 }
 
-// GetKeySpecFromPlugin retrieves the key specification from a plugin by calling DescribeKey.
-func GetKeySpecFromPlugin(ctx context.Context, p plugin.SignPlugin, keyID string, pluginConfig map[string]string) (signature.KeySpec, error) {
-	req := &plugin.DescribeKeyRequest{
+// KeySpecFromPlugin retrieves and validates the key specification from a
+// plugin by calling DescribeKey. It enforces that the plugin's response
+// references the same keyID that was requested.
+func KeySpecFromPlugin(ctx context.Context, p plugin.SignPlugin, keyID string, pluginConfig map[string]string) (signature.KeySpec, error) {
+	if p == nil {
+		return signature.KeySpec{}, errors.New("nil plugin")
+	}
+	if keyID == "" {
+		return signature.KeySpec{}, errors.New("keyID not specified")
+	}
+	resp, err := p.DescribeKey(ctx, &plugin.DescribeKeyRequest{
 		ContractVersion: plugin.ContractVersion,
 		KeyID:           keyID,
 		PluginConfig:    pluginConfig,
-	}
-
-	resp, err := p.DescribeKey(ctx, req)
+	})
 	if err != nil {
-		return signature.KeySpec{}, err
+		return signature.KeySpec{}, fmt.Errorf("failed to describe key %q: %w", keyID, err)
 	}
-
+	if resp.KeyID != "" && resp.KeyID != keyID {
+		return signature.KeySpec{}, fmt.Errorf("keyID in describeKey response %q does not match request %q", resp.KeyID, keyID)
+	}
 	return proto.DecodeKeySpec(resp.KeySpec)
 }
