@@ -60,15 +60,17 @@ func init() {
 }
 
 type mockPlugin struct {
-	failEnvelope      bool
-	wantEnvelope      bool
-	invalidSig        bool
-	invalidCertChain  bool
-	invalidDescriptor bool
-	annotations       map[string]string
-	key               crypto.PrivateKey
-	certs             []*x509.Certificate
-	keySpec           signature.KeySpec
+	failEnvelope          bool
+	wantEnvelope          bool
+	invalidSig            bool
+	invalidCertChain      bool
+	invalidDescriptor     bool
+	describeKeyErr        error
+	describeKeyIDOverride string
+	annotations           map[string]string
+	key                   crypto.PrivateKey
+	certs                 []*x509.Certificate
+	keySpec               signature.KeySpec
 }
 
 func getDescriptorFunc(throwError bool) func(hashAlgo digest.Algorithm) (ocispec.Descriptor, error) {
@@ -108,8 +110,15 @@ func (p *mockPlugin) GetMetadata(ctx context.Context, req *proto.GetMetadataRequ
 
 // DescribeKey returns the KeySpec of a key.
 func (p *mockPlugin) DescribeKey(ctx context.Context, req *proto.DescribeKeyRequest) (*proto.DescribeKeyResponse, error) {
+	if p.describeKeyErr != nil {
+		return nil, p.describeKeyErr
+	}
 	ks, _ := proto.EncodeKeySpec(p.keySpec)
+	// Default behavior matches the historical mock: KeyID is empty unless
+	// describeKeyIDOverride is set. Tests that need a non-empty (and
+	// possibly mismatched) keyID set the override explicitly.
 	return &proto.DescribeKeyResponse{
+		KeyID:   p.describeKeyIDOverride,
 		KeySpec: ks,
 	}, nil
 }
@@ -497,7 +506,10 @@ func TestNewPluginPrimitiveSigner(t *testing.T) {
 	ctx := context.Background()
 	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
 
-	s := NewPluginPrimitiveSigner(ctx, mp, "testKeyID", defaultKeySpec, nil)
+	s, err := NewPluginPrimitiveSigner(ctx, mp, "testKeyID", defaultKeySpec, nil)
+	if err != nil {
+		t.Fatalf("NewPluginPrimitiveSigner() error: %v", err)
+	}
 
 	// verify KeySpec
 	ks, err := s.KeySpec()
@@ -521,24 +533,142 @@ func TestNewPluginPrimitiveSigner(t *testing.T) {
 	}
 }
 
-func TestGetKeySpecFromPlugin(t *testing.T) {
-	ctx := context.Background()
-	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
-
-	got, err := GetKeySpecFromPlugin(ctx, mp, "testKeyID", nil)
-	if err != nil {
-		t.Fatalf("GetKeySpecFromPlugin() error: %v", err)
+func TestNewPluginPrimitiveSigner_NilPlugin(t *testing.T) {
+	_, err := NewPluginPrimitiveSigner(context.Background(), nil, "testKeyID", defaultKeySpec, nil)
+	if err == nil {
+		t.Fatal("expected error for nil plugin, got nil")
 	}
-	if got != defaultKeySpec {
-		t.Fatalf("GetKeySpecFromPlugin() = %v, want %v", got, defaultKeySpec)
+	if !strings.Contains(err.Error(), "nil plugin") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
-func TestGetKeySpecFromPlugin_Error(t *testing.T) {
-	ctx := context.Background()
-	mp := &mockPlugin{}
-	_, err := GetKeySpecFromPlugin(ctx, mp, "testKeyID", nil)
+func TestNewPluginPrimitiveSigner_EmptyKeyID(t *testing.T) {
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+	_, err := NewPluginPrimitiveSigner(context.Background(), mp, "", defaultKeySpec, nil)
 	if err == nil {
-		t.Fatal("expected error for empty keySpec, got nil")
+		t.Fatal("expected error for empty keyID, got nil")
+	}
+	if !strings.Contains(err.Error(), "keyID") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestNewPluginPrimitiveSigner_InvalidKeySpec(t *testing.T) {
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+	_, err := NewPluginPrimitiveSigner(context.Background(), mp, "testKeyID", signature.KeySpec{}, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid keySpec, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid keySpec") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestPluginPrimitiveSigner_ZeroValue(t *testing.T) {
+	s := &PluginPrimitiveSigner{}
+	if _, _, err := s.Sign([]byte("x")); err == nil {
+		t.Error("Sign() on zero value: expected error, got nil")
+	}
+	if _, err := s.KeySpec(); err == nil {
+		t.Error("KeySpec() on zero value: expected error, got nil")
+	}
+}
+
+func TestPluginPrimitiveSigner_SignError(t *testing.T) {
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+	mp.invalidCertChain = true // plugin returns unparseable cert chain
+	s, err := NewPluginPrimitiveSigner(context.Background(), mp, "testKeyID", defaultKeySpec, nil)
+	if err != nil {
+		t.Fatalf("NewPluginPrimitiveSigner() error: %v", err)
+	}
+	if _, _, err := s.Sign([]byte("payload")); err == nil {
+		t.Fatal("expected Sign() to fail when plugin returns invalid cert chain, got nil")
+	}
+}
+
+func TestPluginPrimitiveSigner_ECDSA(t *testing.T) {
+	var ecPair *keyCertPair
+	var ecKeySpec signature.KeySpec
+	for _, p := range keyCertPairCollections {
+		ks, err := signature.ExtractKeySpec(p.certs[0])
+		if err == nil && ks.Type == signature.KeyTypeEC {
+			ecPair = p
+			ecKeySpec = ks
+			break
+		}
+	}
+	if ecPair == nil {
+		t.Skip("no EC keyCertPair available in test fixtures")
+	}
+	mp := newMockPlugin(ecPair.key, ecPair.certs, ecKeySpec)
+	s, err := NewPluginPrimitiveSigner(context.Background(), mp, "testKeyID", ecKeySpec, nil)
+	if err != nil {
+		t.Fatalf("NewPluginPrimitiveSigner() error: %v", err)
+	}
+	sig, certs, err := s.Sign([]byte("payload"))
+	if err != nil {
+		t.Fatalf("Sign() error: %v", err)
+	}
+	if len(sig) == 0 || len(certs) == 0 {
+		t.Fatal("Sign() returned empty result")
+	}
+}
+
+func TestKeySpecFromPlugin(t *testing.T) {
+	ctx := context.Background()
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+
+	got, err := KeySpecFromPlugin(ctx, mp, "testKeyID", nil)
+	if err != nil {
+		t.Fatalf("KeySpecFromPlugin() error: %v", err)
+	}
+	if got != defaultKeySpec {
+		t.Fatalf("KeySpecFromPlugin() = %v, want %v", got, defaultKeySpec)
+	}
+}
+
+func TestKeySpecFromPlugin_NilPlugin(t *testing.T) {
+	if _, err := KeySpecFromPlugin(context.Background(), nil, "testKeyID", nil); err == nil {
+		t.Fatal("expected error for nil plugin, got nil")
+	}
+}
+
+func TestKeySpecFromPlugin_EmptyKeyID(t *testing.T) {
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+	if _, err := KeySpecFromPlugin(context.Background(), mp, "", nil); err == nil {
+		t.Fatal("expected error for empty keyID, got nil")
+	}
+}
+
+func TestKeySpecFromPlugin_KeyIDMismatch(t *testing.T) {
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+	mp.describeKeyIDOverride = "differentKeyID"
+	_, err := KeySpecFromPlugin(context.Background(), mp, "testKeyID", nil)
+	if err == nil {
+		t.Fatal("expected keyID mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestKeySpecFromPlugin_DescribeKeyError(t *testing.T) {
+	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+	mp.describeKeyErr = errors.New("simulated describeKey failure")
+	_, err := KeySpecFromPlugin(context.Background(), mp, "testKeyID", nil)
+	if err == nil {
+		t.Fatal("expected describeKey error to propagate, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to describe key") {
+		t.Errorf("expected wrapped error, got: %v", err)
+	}
+}
+
+func TestKeySpecFromPlugin_DecodeError(t *testing.T) {
+	mp := &mockPlugin{}
+	_, err := KeySpecFromPlugin(context.Background(), mp, "testKeyID", nil)
+	if err == nil {
+		t.Fatal("expected decode error for empty keySpec, got nil")
 	}
 }
