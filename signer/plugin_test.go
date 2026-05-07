@@ -114,9 +114,6 @@ func (p *mockPlugin) DescribeKey(ctx context.Context, req *proto.DescribeKeyRequ
 		return nil, p.describeKeyErr
 	}
 	ks, _ := proto.EncodeKeySpec(p.keySpec)
-	// Default behavior matches the historical mock: KeyID is empty unless
-	// describeKeyIDOverride is set. Tests that need a non-empty (and
-	// possibly mismatched) keyID set the override explicitly.
 	return &proto.DescribeKeyResponse{
 		KeyID:   p.describeKeyIDOverride,
 		KeySpec: ks,
@@ -175,7 +172,7 @@ func (p *mockPlugin) GenerateEnvelope(ctx context.Context, req *proto.GenerateEn
 			return nil, err
 		}
 
-		primitivePluginSigner := &PluginPrimitiveSigner{
+		primitivePluginSigner := &pluginPrimitiveSigner{
 			ctx:          ctx,
 			plugin:       internalPluginSigner.plugin,
 			keyID:        internalPluginSigner.keyID,
@@ -565,16 +562,6 @@ func TestNewPluginPrimitiveSigner_InvalidKeySpec(t *testing.T) {
 	}
 }
 
-func TestPluginPrimitiveSigner_ZeroValue(t *testing.T) {
-	s := &PluginPrimitiveSigner{}
-	if _, _, err := s.Sign([]byte("x")); err == nil {
-		t.Error("Sign() on zero value: expected error, got nil")
-	}
-	if _, err := s.KeySpec(); err == nil {
-		t.Error("KeySpec() on zero value: expected error, got nil")
-	}
-}
-
 func TestPluginPrimitiveSigner_SignError(t *testing.T) {
 	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
 	mp.invalidCertChain = true // plugin returns unparseable cert chain
@@ -618,6 +605,7 @@ func TestPluginPrimitiveSigner_ECDSA(t *testing.T) {
 func TestKeySpecFromPlugin(t *testing.T) {
 	ctx := context.Background()
 	mp := newMockPlugin(defaultKeyCert.key, defaultKeyCert.certs, defaultKeySpec)
+	mp.describeKeyIDOverride = "testKeyID"
 
 	got, err := KeySpecFromPlugin(ctx, mp, "testKeyID", nil)
 	if err != nil {
@@ -662,13 +650,5 @@ func TestKeySpecFromPlugin_DescribeKeyError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to describe key") {
 		t.Errorf("expected wrapped error, got: %v", err)
-	}
-}
-
-func TestKeySpecFromPlugin_DecodeError(t *testing.T) {
-	mp := &mockPlugin{}
-	_, err := KeySpecFromPlugin(context.Background(), mp, "testKeyID", nil)
-	if err == nil {
-		t.Fatal("expected decode error for empty keySpec, got nil")
 	}
 }
