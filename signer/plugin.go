@@ -162,7 +162,7 @@ func (s *PluginSigner) generateSignature(ctx context.Context, desc ocispec.Descr
 	logger := log.GetLogger(ctx)
 	logger.Debug("Generating signature by plugin")
 	genericSigner := GenericSigner{
-		signer: &PluginPrimitiveSigner{
+		signer: &pluginPrimitiveSigner{
 			ctx:          ctx,
 			plugin:       s.plugin,
 			keyID:        s.keyID,
@@ -325,15 +325,8 @@ func parseCertChain(certChain [][]byte) ([]*x509.Certificate, error) {
 	return certs, nil
 }
 
-// PluginPrimitiveSigner implements signature.Signer by delegating raw
-// signature generation to a plugin.SignPlugin.
-//
-// Unlike PluginSigner, which produces a complete JWS/COSE signature
-// envelope for OCI artifact signing, PluginPrimitiveSigner returns the raw
-// signature bytes plus the signing certificate chain. This is required
-// by signature envelopes that build their own structure around a
-// pre-computed signature, such as PKCS#7.
-type PluginPrimitiveSigner struct {
+// pluginPrimitiveSigner implements signature.Signer
+type pluginPrimitiveSigner struct {
 	ctx          context.Context
 	plugin       plugin.SignPlugin
 	keyID        string
@@ -341,13 +334,8 @@ type PluginPrimitiveSigner struct {
 	keySpec      signature.KeySpec
 }
 
-// Sign signs the payload by calling the underlying plugin's GenerateSignature command
-// and returns the raw signature bytes together with the signing certificate
-// chain returned by the plugin.
-func (s *PluginPrimitiveSigner) Sign(payload []byte) ([]byte, []*x509.Certificate, error) {
-	if s == nil || s.plugin == nil {
-		return nil, nil, errors.New("PluginPrimitiveSigner not initialized: use NewPluginPrimitiveSigner")
-	}
+// Sign signs the digest by calling the underlying plugin.
+func (s *pluginPrimitiveSigner) Sign(payload []byte) ([]byte, []*x509.Certificate, error) {
 	// Execute plugin sign command.
 	keySpec, err := proto.EncodeKeySpec(s.keySpec)
 	if err != nil {
@@ -382,18 +370,15 @@ func (s *PluginPrimitiveSigner) Sign(payload []byte) ([]byte, []*x509.Certificat
 	return resp.Signature, certs, nil
 }
 
-// KeySpec returns the KeySpec that the signer was constructed with.
-// The keySpec is supplied at construction time (typically via KeySpecFromPlugin).
-func (s *PluginPrimitiveSigner) KeySpec() (signature.KeySpec, error) {
-	if s == nil || s.plugin == nil {
-		return signature.KeySpec{}, errors.New("PluginPrimitiveSigner not initialized: use NewPluginPrimitiveSigner")
-	}
+// KeySpec returns the keySpec of a keyID by calling describeKey and do some
+// keySpec validation.
+func (s *pluginPrimitiveSigner) KeySpec() (signature.KeySpec, error) {
 	return s.keySpec, nil
 }
 
-// NewPluginPrimitiveSigner creates a new PluginPrimitiveSigner that delegates
-// signing to a plugin. It is intended for callers that need raw signature
-// bytes (PKCS#7) rather than a JWS/COSE envelope.
+// NewPluginPrimitiveSigner returns a signature.Signer that delegates raw
+// signature generation to a plugin. It is intended for callers that need raw
+// signature bytes (PKCS#7) rather than a JWS/COSE envelope.
 func NewPluginPrimitiveSigner(ctx context.Context, p plugin.SignPlugin, keyID string, keySpec signature.KeySpec, pluginConfig map[string]string) (signature.Signer, error) {
 	if p == nil {
 		return nil, errors.New("nil plugin")
@@ -404,7 +389,7 @@ func NewPluginPrimitiveSigner(ctx context.Context, p plugin.SignPlugin, keyID st
 	if _, err := proto.HashAlgorithmFromKeySpec(keySpec); err != nil {
 		return nil, fmt.Errorf("invalid keySpec: %w", err)
 	}
-	return &PluginPrimitiveSigner{
+	return &pluginPrimitiveSigner{
 		ctx:          ctx,
 		plugin:       p,
 		keyID:        keyID,
@@ -431,7 +416,7 @@ func KeySpecFromPlugin(ctx context.Context, p plugin.SignPlugin, keyID string, p
 	if err != nil {
 		return signature.KeySpec{}, fmt.Errorf("failed to describe key %q: %w", keyID, err)
 	}
-	if resp.KeyID != "" && resp.KeyID != keyID {
+	if resp.KeyID != keyID {
 		return signature.KeySpec{}, fmt.Errorf("keyID in describeKey response %q does not match request %q", resp.KeyID, keyID)
 	}
 	return proto.DecodeKeySpec(resp.KeySpec)
